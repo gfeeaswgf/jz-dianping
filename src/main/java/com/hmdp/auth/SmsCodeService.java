@@ -12,83 +12,247 @@ import java.security.SecureRandom;
 import java.util.*;
 import static com.hmdp.utils.RedisConstants.*;
 
-/** 协调验证码状态与短信结果，Lua 负责状态原子性，外部通道不属于 Redis 事务。 */
+
 @Component
 public class SmsCodeService {
+
     private final StringRedisTemplate redis;
     private final ProtectionProperties p;
     private final ProtectionKeys keys;
     private final SmsSender sender;
-    private static final SecureRandom RANDOM=new SecureRandom();
-    private static final DefaultRedisScript<List> RESERVE=script("sms_reserve",List.class);
-    private static final DefaultRedisScript<Long> CLEANUP=script("sms_cleanup",Long.class);
-    private static final DefaultRedisScript<List> VERIFY=script("sms_verify",List.class);
-    /**
-     * @param redis 单实例客户端
-     * @param p 规则配置
-     * @param keys 命名空间
-     * @param sender 短信模拟端口
-     */
-    public SmsCodeService(StringRedisTemplate redis,ProtectionProperties p,ProtectionKeys keys,SmsSender sender) {
-        this.redis=redis;this.p=p;this.keys=keys;this.sender=sender;
+
+    // 生成安全随机验证码
+    private static final SecureRandom RANDOM = new SecureRandom();
+
+    // 加载短信发送预占Lua脚本
+    private static final DefaultRedisScript<List> RESERVE =
+            script("sms_reserve", List.class);
+
+    // 加载短信发送失败清理Lua脚本
+    private static final DefaultRedisScript<Long> CLEANUP =
+            script("sms_cleanup", Long.class);
+
+    // 加载验证码校验Lua脚本
+    private static final DefaultRedisScript<List> VERIFY =
+            script("sms_verify", List.class);
+
+    // 构造方法注入
+    public SmsCodeService(StringRedisTemplate redis,
+                          ProtectionProperties p,
+                          ProtectionKeys keys,
+                          SmsSender sender) {
+        this.redis = redis;
+        this.p = p;
+        this.keys = keys;
+        this.sender = sender;
     }
+
     /**
-     * 原子预占发送额度后调用通道一次；明确失败仅清理本次码，不返配额或释放冷却。
-     * @param phone 符合原手机号规则的号码
-     * @throws ProtectionRejectedException 冷却、配额或锁定拒绝
-     * @throws ProtectionUnavailableException Redis 或通道故障，未知结果保留验证码
-     * @throws ProtectionInvalidRequestException 手机号非法
+     * 发送短信验证码
+     * @param phone 手机号
      */
     public void sendCode(String phone) {
-        if(RegexUtils.isPhoneInvalid(phone)) throw new ProtectionInvalidRequestException();
-        String code=String.format(Locale.ROOT,"%06d",RANDOM.nextInt(1000000));
-        String issue=UUID.randomUUID().toString().replace("-","");
-        List<String> stateKeys=Arrays.asList(keys.key(LOGIN_CODE_KEY,phone),keys.key(SMS_ISSUE_KEY,phone),keys.key(SMS_COOLDOWN_KEY,phone),
-                keys.key(SMS_HOUR_KEY,phone),keys.key(SMS_DAY_KEY,phone),keys.key(VERIFY_LOCK_KEY,phone));
-        List<Long> result=execute(RESERVE,stateKeys,code,issue,String.valueOf(p.getSmsCodeTtlMs()),String.valueOf(p.getSmsCooldownMs()),String.valueOf(p.getSmsHourLimit()),String.valueOf(p.getSmsDayLimit()));
-        if(result.get(0)==1L) throw new ProtectionRejectedException(result.get(1));
-        if(result.get(0)!=0L) throw new ProtectionUnavailableException("SMS_RESERVE_STATE");
-        SmsSendOutcome outcome;
-        try { outcome=sender.send(phone,code,issue); }
-        catch(RuntimeException e) { outcome=SmsSendOutcome.UNKNOWN; }
-        if(outcome==SmsSendOutcome.ACCEPTED) return;
-        if(outcome==SmsSendOutcome.REJECTED) {
-            // 只清理拥有相同签发 ID 的码，旧调用不能删掉后来重发的新码。
-            Long cleaned;
-            try { cleaned=redis.execute(CLEANUP,stateKeys.subList(0,2),issue); }
-            catch(RuntimeException e) { throw new ProtectionUnavailableException("SMS_CLEANUP_FAILURE"); }
-            if(cleaned==null || (cleaned!=0L && cleaned!=1L)) throw new ProtectionUnavailableException("SMS_CLEANUP_STATE");
+
+        // 1. 校验手机号格式
+        if (RegexUtils.isPhoneInvalid(phone)) {
+            throw new ProtectionInvalidRequestException();
         }
+
+        // 2. 生成6位随机验证码
+        String code = String.format(
+                Locale.ROOT,
+                "%06d",
+                RANDOM.nextInt(1000000)
+        );
+
+        // 3. 生成本次验证码的唯一签发ID
+        String issue = UUID.randomUUID()
+                .toString()
+                .replace("-", "");
+
+        // 4. 创建Redis Key集合
+        List<String> stateKeys = Arrays.asList(
+                keys.key(LOGIN_CODE_KEY, phone),
+                keys.key(SMS_ISSUE_KEY, phone),
+                keys.key(SMS_COOLDOWN_KEY, phone),
+                keys.key(SMS_HOUR_KEY, phone),
+                keys.key(SMS_DAY_KEY, phone),
+                keys.key(VERIFY_LOCK_KEY, phone)
+        );
+
+        // 5. 执行Lua脚本，预占短信发送额度
+        List<Long> result = execute(
+                RESERVE,
+                stateKeys,
+                code,
+                issue,
+                String.valueOf(p.getSmsCodeTtlMs()),
+                String.valueOf(p.getSmsCooldownMs()),
+                String.valueOf(p.getSmsHourLimit()),
+                String.valueOf(p.getSmsDayLimit())
+        );
+
+        // 6. 判断是否触发短信限流
+        if (result.get(0) == 1L) {
+            throw new ProtectionRejectedException(result.get(1));
+        }
+
+        // 7. 判断Redis返回状态是否正常
+        if (result.get(0) != 0L) {
+            throw new ProtectionUnavailableException("SMS_RESERVE_STATE");
+        }
+
+        // 8. 调用短信发送服务
+        SmsSendOutcome outcome;
+
+        try {
+            outcome = sender.send(phone, code, issue);
+        } catch (RuntimeException e) {
+            // 发送结果未知
+            outcome = SmsSendOutcome.UNKNOWN;
+        }
+
+        // 9. 短信发送成功，直接返回
+        if (outcome == SmsSendOutcome.ACCEPTED) {
+            return;
+        }
+
+        // 10. 短信明确发送失败，清理本次验证码
+        if (outcome == SmsSendOutcome.REJECTED) {
+
+            Long cleaned;
+
+            try {
+                // 只清理与本次签发ID对应的验证码
+                cleaned = redis.execute(
+                        CLEANUP,
+                        stateKeys.subList(0, 2),
+                        issue
+                );
+            } catch (RuntimeException e) {
+                throw new ProtectionUnavailableException("SMS_CLEANUP_FAILURE");
+            }
+
+            // 10.1 判断清理结果是否合法
+            if (cleaned == null || (cleaned != 0L && cleaned != 1L)) {
+                throw new ProtectionUnavailableException("SMS_CLEANUP_STATE");
+            }
+        }
+
+        // 11. 短信发送失败或发送结果未知
         throw new ProtectionUnavailableException("SMS_DELIVERY_UNAVAILABLE");
     }
 
     /**
-     * 在同一次 Lua 中比较、计错并成功消费，避免并发请求同时通过 Java GET/DEL。
+     * 校验并消费验证码
      * @param phone 手机号
-     * @param code 六位数字验证码
-     * @return 仅首次正确消费为 true；错误、缺失、过期、已消费统一为 false
-     * @throws ProtectionRejectedException 手机号锁定时抛出
-     * @throws ProtectionUnavailableException Redis 或状态异常时抛出
-     * @throws ProtectionInvalidRequestException 格式非法时抛出
+     * @param code 验证码
+     * @return 验证码是否正确
      */
-    public boolean verifyAndConsume(String phone,String code) {
-        if(RegexUtils.isPhoneInvalid(phone) || code==null || !code.matches("[0-9]{6}")) throw new ProtectionInvalidRequestException();
-        List<Long> result=execute(VERIFY,Arrays.asList(keys.key(LOGIN_CODE_KEY,phone),keys.key(SMS_ISSUE_KEY,phone),keys.key(VERIFY_FAIL_KEY,phone),keys.key(VERIFY_LOCK_KEY,phone)),
-                code,String.valueOf(p.getVerifyFailureLimit()),String.valueOf(p.getVerifyFailureWindowMs()),String.valueOf(p.getVerifyLockMs()));
-        if(result.get(0)==1L) throw new ProtectionRejectedException(result.get(1));
-        return result.get(0)==0L;
+    public boolean verifyAndConsume(String phone, String code) {
+
+        // 1. 校验手机号和验证码格式
+        if (RegexUtils.isPhoneInvalid(phone)
+                || code == null
+                || !code.matches("[0-9]{6}")) {
+            throw new ProtectionInvalidRequestException();
+        }
+
+        // 2. 创建验证码校验所需的Redis Key
+        List<String> stateKeys = Arrays.asList(
+                keys.key(LOGIN_CODE_KEY, phone),
+                keys.key(SMS_ISSUE_KEY, phone),
+                keys.key(VERIFY_FAIL_KEY, phone),
+                keys.key(VERIFY_LOCK_KEY, phone)
+        );
+
+        // 3. 执行Lua脚本校验验证码
+        List<Long> result = execute(
+                VERIFY,
+                stateKeys,
+                code,
+                String.valueOf(p.getVerifyFailureLimit()),
+                String.valueOf(p.getVerifyFailureWindowMs()),
+                String.valueOf(p.getVerifyLockMs())
+        );
+
+        // 4. 判断手机号是否被锁定
+        if (result.get(0) == 1L) {
+            throw new ProtectionRejectedException(result.get(1));
+        }
+
+        // 5. 返回验证码校验结果
+        return result.get(0) == 0L;
     }
+
+    /**
+     * 执行Redis Lua脚本
+     * @param script Lua脚本
+     * @param stateKeys Redis Key集合
+     * @param args Lua脚本参数
+     * @return Lua脚本执行结果
+     */
     @SuppressWarnings("unchecked")
-    private List<Long> execute(DefaultRedisScript<List> script,List<String> stateKeys,Object... args) {
+    private List<Long> execute(DefaultRedisScript<List> script,
+                               List<String> stateKeys,
+                               Object... args) {
+
+        // 1. 执行Redis Lua脚本
         List<?> reply;
-        try { reply=redis.execute(script,stateKeys,args); }
-        catch(RuntimeException e) { throw new ProtectionUnavailableException("SMS_REDIS_FAILURE"); }
-        if(reply==null || reply.size()!=2 || !(reply.get(0) instanceof Long) || !(reply.get(1) instanceof Long)) throw new ProtectionUnavailableException("SMS_REPLY_INVALID");
-        long status=(Long)reply.get(0),wait=(Long)reply.get(1);
-        if(!((status==0 || status==2) && wait==0) && !(status==1 && wait>0 && wait<=86400000L)) throw new ProtectionUnavailableException("SMS_STATE_INVALID");
-        return (List<Long>)reply;
+
+        try {
+            reply = redis.execute(script, stateKeys, args);
+        } catch (RuntimeException e) {
+            throw new ProtectionUnavailableException("SMS_REDIS_FAILURE");
+        }
+
+        // 2. 判断Lua返回结果是否合法
+        if (reply == null
+                || reply.size() != 2
+                || !(reply.get(0) instanceof Long)
+                || !(reply.get(1) instanceof Long)) {
+            throw new ProtectionUnavailableException("SMS_REPLY_INVALID");
+        }
+
+        // 3. 获取返回状态和等待时间
+        long status = (Long) reply.get(0);
+        long wait = (Long) reply.get(1);
+
+        // 4. 判断返回状态是否合法
+        boolean validSuccess = (status == 0 || status == 2) && wait == 0;
+
+        boolean validRejected = status == 1
+                && wait > 0
+                && wait <= 86400000L;
+
+        if (!validSuccess && !validRejected) {
+            throw new ProtectionUnavailableException("SMS_STATE_INVALID");
+        }
+
+        // 5. 返回Lua执行结果
+        return (List<Long>) reply;
     }
-    private static <T> DefaultRedisScript<T> script(String name,Class<T> type) {
-        DefaultRedisScript<T> s=new DefaultRedisScript<>();s.setLocation(new ClassPathResource("lua/protection/"+name+".lua"));s.setResultType(type);return s;
+
+    /**
+     * 加载Redis Lua脚本
+     * @param name 脚本名称
+     * @param type 返回值类型
+     * @return Lua脚本对象
+     */
+    private static <T> DefaultRedisScript<T> script(String name, Class<T> type) {
+
+        // 1. 创建Lua脚本对象
+        DefaultRedisScript<T> script = new DefaultRedisScript<>();
+
+        // 2. 设置Lua脚本路径
+        script.setLocation(
+                new ClassPathResource("lua/protection/" + name + ".lua")
+        );
+
+        // 3. 设置Lua脚本返回类型
+        script.setResultType(type);
+
+        // 4. 返回Lua脚本对象
+        return script;
     }
 }
