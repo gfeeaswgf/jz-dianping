@@ -1,51 +1,57 @@
 package com.hmdp.utils;
 
-import cn.hutool.core.bean.BeanUtil;
-import cn.hutool.core.util.StrUtil;
+import com.hmdp.auth.TokenSessionService;
 import com.hmdp.dto.UserDTO;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.web.servlet.HandlerInterceptor;
 
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
-
-import static com.hmdp.utils.RedisConstants.LOGIN_USER_KEY;
-import static com.hmdp.utils.RedisConstants.LOGIN_USER_TTL;
-
+/** 恢复身份并原子续期；异常与请求结束均清理 ThreadLocal，权限检查仍由登录拦截器负责。 */
 public class RefreshTokenInterceptor implements HandlerInterceptor {
 
-    private StringRedisTemplate stringRedisTemplate;
+    private final TokenSessionService tokenSessionService;
 
-    public RefreshTokenInterceptor(StringRedisTemplate stringRedisTemplate) {
-        this.stringRedisTemplate = stringRedisTemplate;
+    /**
+
+     * @param tokenSessionService 会话存储与续期组件
+
+     */
+    public RefreshTokenInterceptor(TokenSessionService tokenSessionService) {
+        this.tokenSessionService = tokenSessionService;
     }
 
+    /**
+
+     * @param request 当前请求
+
+     * @param response 当前响应
+
+     * @param handler 后续处理器
+
+     * @return 放行至登录检查
+
+     */
     @Override
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
-        // 1.获取请求头中的token
-        String token = request.getHeader("authorization");
-        if (StrUtil.isBlank(token)) {
+        UserHolder.removeUser();
+        try {
+            UserDTO user = tokenSessionService.resolveAndRefresh(request.getHeader("authorization"));
+            if (user != null) UserHolder.saveUser(user);
             return true;
-        }
-        // 2.基于TOKEN获取redis中的用户
-        String key  = LOGIN_USER_KEY + token;
-        Map<Object, Object> userMap = stringRedisTemplate.opsForHash().entries(key);
-        // 3.判断用户是否存在
-        if (userMap.isEmpty()) {
-            return true;
-        }
-        // 5.将查询到的hash数据转为UserDTO
-        UserDTO userDTO = BeanUtil.fillBeanWithMap(userMap, new UserDTO(), false);
-        // 6.存在，保存用户信息到 ThreadLocal
-        UserHolder.saveUser(userDTO);
-        // 7.刷新token有效期
-        stringRedisTemplate.expire(key, LOGIN_USER_TTL, TimeUnit.MINUTES);
-        // 8.放行
-        return true;
+        } catch (RuntimeException e) { UserHolder.removeUser(); throw e; }
     }
 
+    /**
+
+     * @param request 当前请求
+
+     * @param response 当前响应
+
+     * @param handler 处理器
+
+     * @param ex 处理异常，可能为空
+
+     */
     @Override
     public void afterCompletion(HttpServletRequest request, HttpServletResponse response, Object handler, Exception ex) throws Exception {
         // 移除用户
